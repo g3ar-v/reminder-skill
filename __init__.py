@@ -1,33 +1,23 @@
-# Copyright 2016 Mycroft AI Inc.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import re
 import time
+import sys
 from os.path import dirname, join
-from datetime import datetime, timedelta
-from mycroft import MycroftSkill, intent_handler
-from mycroft.util.parse import extract_datetime, normalize
-from mycroft.util.time import now_local
-from mycroft.util.format import nice_time, nice_date
-from mycroft.util import play_wav
-from mycroft.messagebus.client import MessageBusClient
+from datetime import datetime, timedelta, timezone
+from pyicloud import PyiCloudService
+from core import Skill, intent_handler
+from core.util.parse import extract_datetime, normalize
+from core.util.time import now_local, default_timezone
+from core.util.format import nice_time, nice_date
+from core.util import play_wav
+from core.messagebus.client import MessageBusClient
 
 REMINDER_PING = join(dirname(__file__), 'twoBeep.wav')
 
 MINUTES = 60  # seconds
+HOURS = MINUTES * 60
 
 DEFAULT_TIME = now_local().replace(hour=8, minute=0, second=0)
+
 
 def deserialize(dt):
     return datetime.strptime(dt, '%Y%d%m-%H%M%S-%z')
@@ -49,7 +39,7 @@ def contains_datetime(utterance, lang='en-us'):
     return extract_datetime(utterance) is not None
 
 
-class ReminderSkill(MycroftSkill):
+class ReminderSkill(Skill):
     def __init__(self):
         super(ReminderSkill, self).__init__()
         self.notes = {}
@@ -61,14 +51,103 @@ class ReminderSkill(MycroftSkill):
     def initialize(self):
         # Handlers for notifications after speak
         # TODO Make this work better in test
+        icloud_username = self.settings.get("icloud_username")
+        icloud_key = self.settings.get("icloud_password")
+        self.icloud = PyiCloudService(apple_id=icloud_username, password=icloud_key)
+        self.authenticate_with_2factor(self.icloud)
+
         if isinstance(self.bus, MessageBusClient):
             self.bus.on('speak', self.prime)
-            self.bus.on('mycroft.skill.handler.complete', self.notify)
-            self.bus.on('mycroft.skill.handler.start', self.reset)
+            self.bus.on('core.skill.handler.complete', self.notify)
+            self.bus.on('core.skill.handler.start', self.reset)
 
         # Reminder checker event
         self.schedule_repeating_event(self.__check_reminder, datetime.now(),
                                       0.5 * MINUTES, name='reminder')
+        # NOTE: Schedule the event to repeat every 7 minutes
+        # because it checks for a 15 mins range
+        self.schedule_repeating_event(self.__check_events, datetime.now() + timedelta(seconds=30), 7.5 * MINUTES,
+                                      name='daily_event_check')
+
+    def authenticate_with_2factor(self, api):
+        if api.requires_2fa:
+            self.log.info("Two-factor authentication required.")
+            code = input("Enter the code you received of one of your approved devices: ")
+            result = api.validate_2fa_code(code)
+            self.log.info("Code validation result: %s" % result)
+
+            if not result:
+                self.log.info("Failed to verify security code")
+                sys.exit(1)
+
+            if not api.is_trusted_session:
+                self.log.info("Session is not trusted. Requesting trust...")
+                result = api.trust_session()
+                self.log.info("Session trust result %s" % result)
+
+                if not result:
+                    self.log.info("Failed to request trust. \
+                                  You will likely be prompted for the code again in the coming weeks")
+        elif api.requires_2sa:
+            import click
+            self.log.info("Two-step authentication required. Your trusted devices are:")
+
+            devices = api.trusted_devices
+            for i, device in enumerate(devices):
+                self.log.info("  %s: %s" % (i, device.get('deviceName',
+                                                          "SMS to %s" % device.get('phoneNumber'))))
+
+            device = click.prompt('Which device would you like to use?', default=0)
+            device = devices[device]
+            if not api.send_verification_code(device):
+                self.log.info("Failed to send verification code")
+                sys.exit(1)
+
+            code = click.prompt('Please enter validation code')
+            if not api.validate_verification_code(device, code):
+                self.log.info("Failed to verify verification code")
+                sys.exit(1)
+
+    @intent_handler('WhatDoIHaveToday.intent')
+    def handle_what_do_i_have_today(self, message):
+        self.__check_events_without_notification(message)
+
+    def __check_events_without_notification(self, message):
+        today = now_local().date()
+        events = self.icloud.calendar.events()  # Fetch events from iCloud calendar
+        for event in events:
+            event_time = datetime.strptime(' '.join(map(str, event['startDate'][1:-1])), '%Y %m %d %H %M')
+            if event_time.date() == today:
+                self.speak_dialog('Reminding', data={'reminder': event['title']})
+
+    # TODO: write test for this method
+    # TODO: check events based on the alarm set in iCalendar
+    def __check_events(self, message):
+        """Check for events happening today and their time and notify."""
+        today = now_local().date()
+        events = self.icloud.calendar.events()  # Fetch events from iCloud calendar
+        # self.log.info(f"events for today: {}")
+        today_events = [event for event in events if datetime.strptime(' '.join(map(str, event['startDate'][1:-1])),
+                                                                       '%Y %m %d %H %M').date() == today]
+        self.log.info(f"events for today: {[events['title'] for events in today_events]}")
+        time_context_events = [event for event in today_events if datetime.strptime(
+            ' '.join(map(str, event['startDate'][1:-1])), '%Y %m %d %H %M').time() > now_local().time()]
+
+        for event in time_context_events:
+            event_time = datetime.strptime(' '.join(map(str, event['startDate'][1:-1])), '%Y %m %d %H %M')
+            # event_time = event_time.replace(tzinfo=default_timezone)
+
+            self.log.info(f"event: {event['title']} at {event_time}")
+            # self.log.info(f"now: {datetime.now()}")
+            # self.log.info(f"15 mins before: {event_time - timedelta(minutes=15)}")
+            if (event_time - timedelta(minutes=15)) <= datetime.now() <= event_time:
+                self.speak_dialog('Interruption', wait=True)
+                response = self.get_response()
+                if self.voc_match(response, 'Approval'):
+                    self.speak_dialog('Reminding', data={'reminder': event['title']})
+                else:
+                    self.log.debug("Snoozed event reminder for %s", event['title'])
+                    self.schedule_event(self.__check_events, 5 * MINUTES, name='snoozed_check_event')
 
     def add_notification(self, identifier, note, expiry):
         self.notes[identifier] = (note, expiry)
@@ -112,6 +191,13 @@ class ReminderSkill(MycroftSkill):
                     self.cancellable.append(r[0])
 
             self.primed = False
+
+    def prompt_reminder(self, message):
+        """ Repeating event handler.
+
+        Prompt User if he needs anything or wants core to remember anything
+        """
+        pass
 
     def __check_reminder(self, message):
         """Repeating event handler.
@@ -430,11 +516,19 @@ class ReminderSkill(MycroftSkill):
             return False
 
     def shutdown(self):
+        self.cancel_scheduled_event('daily_event_check')
+
         if isinstance(self.bus, MessageBusClient):
             self.bus.remove('speak', self.prime)
-            self.bus.remove('mycroft.skill.handler.complete', self.notify)
-            self.bus.remove('mycroft.skill.handler.start', self.reset)
+            self.bus.remove('core.skill.handler.complete', self.notify)
+            self.bus.remove('core.skill.handler.start', self.reset)
 
 
 def create_skill():
     return ReminderSkill()
+
+
+if __name__ == "__main__":
+    skill = ReminderSkill()
+    skill.initialize()
+    # skill.authenticate_2factor(skill.icloud)
