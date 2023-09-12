@@ -1,1 +1,5 @@
-(could you |)remind me (about|of|to) {reminder}
+(could you |)remind me (to|about) {reminder}
+please remind me (about|of|to) {reminder}
+please remind me (to|about) {reminder}
+can you remind me (about|of|to) {reminder}
+can you remind me (to|about) {reminder}
