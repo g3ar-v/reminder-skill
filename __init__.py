@@ -6,21 +6,16 @@ from tkinter import simpledialog
 from os.path import dirname, join
 from datetime import datetime, timedelta
 from pyicloud import PyiCloudService
-from langchain.prompts import PromptTemplate
 from core import Skill, intent_handler
-from core.llm.llm import use_llm
+from core.llm import LLM
 from core.util.parse import extract_datetime
 from core.util.time import now_local
 from core.util.format import nice_time, nice_date
 from core.util import play_wav
 from core.messagebus.client import MessageBusClient
-from core.llm.prompt_template import persona_template
-
-model = "gpt-3.5-turbo"
+from core.llm.prompt_template import dialog_prompt
 
 
-# template =
-prompt = PromptTemplate(input_variables=["context", "query"], template=persona_template)
 REMINDER_PING = join(dirname(__file__), "twoBeep.wav")
 
 MINUTES = 60  # seconds
@@ -64,6 +59,7 @@ class ReminderSkill(Skill):
         icloud_key = self.settings.get("icloud_password")
         self.icloud = PyiCloudService(apple_id=icloud_username, password=icloud_key)
         self.authenticate_with_2factor(self.icloud)
+        # self.log.info(f"Calendars : {self.icloud.calendar.get_calendars()}")
 
         # TODO Make this work better in test
         if isinstance(self.bus, MessageBusClient):
@@ -149,7 +145,11 @@ class ReminderSkill(Skill):
     @intent_handler("WhatDoIHaveToday.intent")
     def notify_event_list(self, message):
         today = now_local().date()
-        events = self.icloud.calendar.events()  # Fetch events from iCloud calendar
+        events = self.icloud.calendar.get_events(
+            from_dt=today, to_dt=today
+        )  # Fetch events from iCloud calendar
+
+        # get title events for today
         event_list = [
             event["title"]
             for event in events
@@ -159,71 +159,72 @@ class ReminderSkill(Skill):
             == today
         ]
 
+        # TODO: sort events by start time
         event_list_str = ", ".join(event_list)
         context = f"""Given a list
         of events, and a query, answer that query with the list. Say it in
         a sentence format.
-        Here is the list of today's events: {event_list_str}"""
+        Here is the list of my events for today: {event_list_str}.
+        if there's nothing in the list say 'no events' or somehting similar"""
         utterance = message.data.get("utterance")
-        response = use_llm(prompt=prompt, context=context, query=utterance)
+        response = LLM.use_llm(prompt=dialog_prompt, context=context, query=utterance)
         self.speak(response)
 
     # TODO: write test for this method
+    # * check for birthdays
     # TODO: check events based on the alarm set in iCalendar
     def __check_events_and_notify(self, message):
         """Check for events happening today and their time and notify."""
         today = now_local().date()
-        events = self.icloud.calendar.events()  # Fetch events from iCloud calendar
+        events = self.icloud.calendar.get_events(from_dt=today, to_dt=today)
 
-        today_events = [
-            event
-            for event in events
-            if datetime.strptime(
-                " ".join(map(str, event["startDate"][1:-1])), "%Y %m %d %H %M"
-            ).date()
-            == today
-        ]
         self.log.info(
-            f"events for today: {[events['title'] for events in today_events]}"
+            f"today events from get_events: {[event['title'] for event in events]}"
         )
-        time_context_events = [
-            event
-            for event in today_events
-            if datetime.strptime(
-                " ".join(map(str, event["startDate"][1:-1])), "%Y %m %d %H %M"
-            ).time()
-            > now_local().time()
-        ]
 
-        for event in time_context_events:
+        # format events object into datetime object and get events for today
+        today_events = []
+        for event in events:
             event_time = datetime.strptime(
                 " ".join(map(str, event["startDate"][1:-1])), "%Y %m %d %H %M"
             )
-            # event_time = event_time.replace(tzinfo=default_timezone)
+            if event_time.date() == today and event_time.time() > now_local().time():
+                today_events.append((event, event_time))
 
-            self.log.info(f"event: {event['title']} at {event_time}")
-            # self.log.info(f"now: {datetime.now()}")
-            # self.log.info(f"15 mins before: {event_time - timedelta(minutes=15)}")
+        self.log.info(f"events in the next 15mins: {today_events}")
+
+        upcoming_events = []
+        # check for events in next 15 mins and notify
+        for event, event_time in today_events:
             if (event_time - timedelta(minutes=15)) <= datetime.now() <= event_time:
-                self.speak_dialog("Interruption", wait=True)
-                response = self.get_response()
-                if self.voc_match(response, "Approval"):
-                    query = f"""Your response should
-                    say that "{event["title"]} needs to be started very soon"
-                    or in another sentence similar"""
+                upcoming_events.append(
+                    f"{event['title']} at {event_time.strftime('%I:%M %p')}"
+                )
 
-                    context = f"how would you notify me that {event['title']} needs to start very soon"
-                    response = use_llm(prompt=prompt, context=context, query=query)
-                    self.speak(response)
+        if upcoming_events:
+            self.speak_dialog("Interruption", wait=True)
+            response = self.get_response()
+            if self.voc_match(response, "Approval"):
+                query = """Your response should
+                imply that the event or events need to be started very soon
+                or in another sentence similar. """
 
-                    # self.speak_dialog("RemindingEvent", data={"event": event["title"]})
-                else:
-                    self.log.debug("Snoozed event reminder for %s", event["title"])
-                    self.schedule_event(
-                        self.__check_events_and_notify,
-                        5 * MINUTES,
-                        name="snoozed_check_event",
-                    )
+                context = f"""Given a list of eventnames and their time
+                {upcoming_events}.
+                This is the current date and time {today.strftime("%B %d, %Y")} at
+                {today.strftime("%I:%M %p")}.
+                Use it to produce a much more intelligent response"""
+                response = LLM.use_llm(
+                    prompt=dialog_prompt, context=context, query=query
+                )
+                self.speak(response)
+            else:
+                self.log.debug("Snoozed event reminder for %s", event["title"])
+                self.schedule_event(
+                    self.__check_events_and_notify,
+                    5 * MINUTES,
+                    name="snoozed_check_event",
+                )
 
     def add_notification(self, identifier, note, expiry):
         self.notes[identifier] = (note, expiry)
@@ -628,6 +629,7 @@ class ReminderSkill(Skill):
 
     def shutdown(self):
         self.cancel_scheduled_event("daily_event_check")
+        self.cancel_scheduled_event("snoozed_check_event")
 
         if isinstance(self.bus, MessageBusClient):
             self.bus.remove("speak", self.prime)
